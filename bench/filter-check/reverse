@@ -1,0 +1,3 @@
+#!/bin/sh
+# Reverse the feature order (tac needs the last newline).
+{ cat; echo; } | tac

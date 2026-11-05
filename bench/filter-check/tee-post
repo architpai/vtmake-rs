@@ -1,0 +1,2 @@
+#!/bin/sh
+tee "$FILTER_DIR/post-$1-$2-$3.json"

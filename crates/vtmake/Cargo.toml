@@ -1,0 +1,28 @@
+[package]
+name = "vtmake"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "vtmake: fast vector tiles, a reimplementation of felt/tippecanoe"
+
+[[bin]]
+name = "vtmake"
+path = "src/main.rs"
+
+[dependencies]
+vtmake-core = { path = "../vtmake-core" }
+vtmake-mvt = { path = "../vtmake-mvt" }
+vtmake-out = { path = "../vtmake-out" }
+memmap2 = "0.9"
+memchr = "2"
+flate2 = "1"
+rayon = "1"
+crossbeam-channel = "0.5"
+hashbrown = "0.16"
+foldhash = "0.2"
+mimalloc = { version = "0.1", default-features = false, features = ["override"] }
+vtmake-parse = { path = "../vtmake-parse" }
+vtmake-geom = { path = "../vtmake-geom" }
+vtmake-wagyu = { path = "../vtmake-wagyu" }
+vtmake-tools = { path = "../vtmake-tools" }
+vtmake-filter = { path = "../vtmake-filter" }

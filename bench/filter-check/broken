@@ -1,0 +1,3 @@
+#!/bin/sh
+# Read a few bytes and stop: the writer gets a broken pipe.
+head -c 10 > /dev/null

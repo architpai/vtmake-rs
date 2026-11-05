@@ -1,0 +1,49 @@
+vtmake — fast vector tiles
+==========================
+
+vtmake is a reimplementation of tippecanoe in Rust. It makes the same tiles as
+tippecanoe v2.82.0, at higher speed. Most of its tiling
+logic is a port of tippecanoe's C++ code, and it includes code from other open
+source projects. We thank their authors. Their licences require these notices,
+and we keep them gladly.
+
+tippecanoe (felt/tippecanoe, https://github.com/felt/tippecanoe)
+  Copyright (c) 2022, Protomaps LLC
+  Copyright (c) 2014, Mapbox Inc.
+  BSD 2-Clause licence: LICENSE-tippecanoe.md
+  Used: the behaviour and algorithms of tippecanoe v2.82.0 (felt 4f26211),
+  ported to Rust in crates/vtmake-geom, crates/vtmake-parse, crates/vtmake-mvt,
+  crates/vtmake-out, crates/vtmake-tools (tile-join, tippecanoe-decode,
+  tippecanoe-enumerate, tippecanoe-overzoom, and tippecanoe-json-tool),
+  crates/vtmake-filter (evaluator.cpp) and crates/vtmake. The PMTiles v3 port uses pmtiles_file.cpp and
+  pmtiles/pmtiles.hpp from this same source. The differential tests compile
+  tippecanoe's own source code as a reference.
+
+Wagyu (mapbox/wagyu 0.5.0) and mapbox/geometry.hpp, mapbox/variant
+  Copyright (c) 2016-2017, Mapbox; parts derived from the Clipper Library by
+  Angus Johnson (Boost Software Licence)
+  ISC / BSD licences: crates/vtmake-wagyu/vendor/mapbox/LICENSE-*
+  Used: polygon cleaning (vendored C++ headers, called through FFI).
+
+zlib 1.3.1
+  Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
+  zlib licence: crates/vtmake-zlib/zlib/LICENSE
+  Used: tile compression (vendored source with speed patches that give the
+  same output bytes; see crates/vtmake-zlib/PATCHES.md). This is an altered
+  version of zlib, not the original.
+
+dtoa_milo (Milo Yip, from the miloyip/dtoa-benchmark project, as vendored by
+tippecanoe)
+  Copyright (C) 2014 Milo Yip
+  MIT licence: crates/vtmake-parse/vendor/LICENSE.txt
+  Used: number formatting, ported to Rust.
+
+FlatGeobuf (flatgeobuf/flatgeobuf, https://github.com/flatgeobuf/flatgeobuf)
+  Copyright (c) 2018, Björn Harrtell
+  BSD 2-Clause licence (the same terms as LICENSE-tippecanoe.md)
+  Used: the FlatGeobuf schema (header.fbs, feature.fbs) and PackedRTreeSize,
+  as tippecanoe's flatgeobuf.cpp includes them, ported to Rust in
+  crates/vtmake-parse/src/fgb.rs.
+
+Rust crates from crates.io keep their own licences (see Cargo.lock and each
+crate's metadata).

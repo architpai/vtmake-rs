@@ -1,0 +1,3 @@
+#!/bin/sh
+# Change and add attributes, and remove the "dropped" flag.
+sed -e 's/"properties": {/"properties": { "zxy": "'"$1-$2-$3"'", "big": 12345678901234567890, "neg": -7, "f": 0.1, "t": true, "n": null, "arr": [1, "a"],/' -e 's/"dropped": [a-z]*, //'

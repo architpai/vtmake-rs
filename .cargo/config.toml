@@ -1,0 +1,4 @@
+[env]
+# tippecanoe's system SQLite has no STAT4, so its ANALYZE makes only
+# `sqlite_stat1`. Build the bundled SQLite in the same way (spec 9.4).
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_STAT4"

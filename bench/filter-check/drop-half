@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keep every second feature (one feature on each line).
+awk 'NR % 2 == 1'

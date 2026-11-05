@@ -1,0 +1,9 @@
+[package]
+name = "vtmake-filter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Feature filters -j/-J: a port of tippecanoe's evaluator.cpp, for vtmake build, join and overzoom"
+
+[dependencies]
+vtmake-parse = { path = "../vtmake-parse" }

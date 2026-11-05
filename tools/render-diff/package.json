@@ -1,0 +1,16 @@
+{
+  "name": "vtmake-render-diff",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "compare": "node index.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "maplibre-gl": "6.16.0",
+    "playwright": "^1.58.2",
+    "pngjs": "^7.0.0",
+    "stream-json": "3.8.0"
+  }
+}

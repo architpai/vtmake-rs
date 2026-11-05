@@ -1,0 +1,5 @@
+#!/bin/sh
+# Features with empty geometry: a layer with no features.
+cat > /dev/null
+echo '{"type": "Feature", "tippecanoe": {"layer": "empty"}, "properties": {"a": 1}, "geometry": {"type": "MultiPoint", "coordinates": []}}'
+echo '{"type": "Feature", "tippecanoe": {"layer": "full"}, "properties": {"b": "x"}, "geometry": {"type": "LineString", "coordinates": [[0,0],[30,30]]}}'

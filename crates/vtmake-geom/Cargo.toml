@@ -1,0 +1,20 @@
+[package]
+name = "vtmake-geom"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Exact port of the tippecanoe geometry functions (projection, clip, simplify, tiny polygons)"
+
+[features]
+# Build tippecanoe's real C++ code (from the source tree in TIPPECANOE_SRC)
+# and link it, for differential tests. Test use only.
+cpp-ref = ["dep:cc"]
+
+[dependencies]
+vtmake-core = { path = "../vtmake-core" }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[dev-dependencies]
+rayon = "1"

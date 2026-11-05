@@ -1,0 +1,5 @@
+#!/bin/sh
+# Give the input back, then add two features in a FeatureCollection.
+cat
+echo
+echo '{"type":"FeatureCollection","features":[{"type":"Feature","id":77,"tippecanoe":{"layer":"added","index":12,"sequence":3,"extent":5,"dropped":false},"properties":{"z":'"$1"'},"geometry":{"type":"Point","coordinates":[10,10]}},{"type":"Feature","properties":null,"geometry":{"type":"Polygon","coordinates":[[[0,0],[20,0],[20,20],[0,20],[0,0]],[[5,5],[5,10],[10,10],[10,5],[5,5]]]}}]}'

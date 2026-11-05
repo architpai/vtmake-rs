@@ -1,0 +1,15 @@
+[package]
+name = "vtmake-mvt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "MVT encoding and gzip with tippecanoe's exact byte layout"
+
+[dependencies]
+vtmake-core = { path = "../vtmake-core" }
+vtmake-zlib = { path = "../vtmake-zlib" }
+libdeflater = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1"
