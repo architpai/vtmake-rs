@@ -30,7 +30,7 @@
 
 use crate::cli::{Options, Projection};
 use crate::drop::Retry;
-use crate::store::{Chunk, FeatMeta, Sorted, Val, encode_geom, put_varint};
+use crate::store::{Chunk, FeatMeta, Sorted, encode_geom, put_varint};
 use crate::tile::{Cand, Ctx};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -889,14 +889,10 @@ fn store(parsed: Vec<Parsed>, ox: i64, oy: i64, extents: bool) -> Store {
         encode_geom(&world, &mut c.geom);
         let attr_off = c.attrs.len() as u32;
         for (k, ty, text) in &f.attrs {
-            let ki = *keys.entry(k.clone()).or_insert_with(|| {
-                c.keys.push(k.clone());
-                (c.keys.len() - 1) as u32
-            });
-            c.vals.push(Val { ty: *ty, off: c.val_text.len() as u32, len: text.len() as u32 });
-            c.val_text.extend_from_slice(text.as_bytes());
+            let ki = *keys.entry(k.clone()).or_insert_with(|| c.push_key(k.clone()));
+            let vi = c.push_val(*ty, text.as_bytes());
             put_varint(&mut c.attrs, ki as u64);
-            put_varint(&mut c.attrs, (c.vals.len() - 1) as u64);
+            put_varint(&mut c.attrs, vi as u64);
         }
         let id = match f.id {
             Some(v) => {
@@ -958,6 +954,7 @@ pub(crate) fn prefilter_detail<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, 
     let default_layers = ["unknown"];
     let tmpdir = &ctx.opts.tmpdir;
     let sub = Ctx {
+        selection: ctx.selection,
         skip_tiles: Default::default(),
         trial_blocked: Default::default(),
         drop_state: Mutex::new(*ctx.drop_state.lock().unwrap()),

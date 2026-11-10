@@ -43,6 +43,12 @@ NDJSON ──mmap──► chunk split ──rayon──► parse + project ─�
    results first.
 6. **Encode MVT by hand.** Write the protobuf bytes directly. Keep the feature
    order and the key/value order of tippecanoe where cheap (second goal).
+   The key/value index of a layer has the dedup slots of tippecanoe (one slot
+   for each hash, and a collision adds a duplicate). The feature store keeps
+   the slot of each key and value, so the tile code does not calculate a hash.
+   Each key and value from the store has a source id (the text for a short
+   text, else the chunk and the value id). When the ids are equal, the index
+   does not compare the text or parse the number.
 7. **Compress tiles fast.** gzip with `libdeflate` (much faster than zlib).
    The bytes differ from zlib's bytes, but the decoded tile is the same.
 8. **One writer thread.** MBTiles inserts in large transactions, in a fixed
@@ -59,3 +65,32 @@ NDJSON ──mmap──► chunk split ──rayon──► parse + project ─�
 
 - Binary name `tippecanoe` (drop-in), also `bt`. Accept the flags of the plain
   command line first. Fail with a clear error for flags that are not supported yet.
+
+## Large tiles with active limits
+
+Tile size and feature limits need ordered zoom passes. Each zoom repeats until
+all tiles use the same drop thresholds. The next zoom starts after this rule
+finishes. Child geometry stays in disk queues in `-t`.
+
+For the default geometry options, large tiles clip features in parts of 16,384
+features. vtmake joins the results in feature order. Each child refers to the
+parent's clipped geometry until the queue writes it. This removes the expanded
+geometry copy for each child. One compact clip record holds the candidate and
+child flags. The largest child reuses the input feature list. Variable-depth
+tiles keep the original clip path.
+
+Queue records have independent blocks of 8,192 features. Large records encode
+and decode those blocks in parallel. A batch holds at most 64 encoded blocks.
+Geometry arrays reserve their known size before they grow.
+
+Selection, rate drops, tiny-polygon accumulation, and attribute accumulation
+stay in feature order. Early simplification and final geometry steps can run
+in parallel after selection. These steps need at least 2,048 kept features.
+The results return in feature order. vtmake then adds layer keys, values, and
+features in that order. Shared-node data stays fixed during each parallel step.
+
+The split clip path, the child references to the parent geometry, and the block
+queue format apply at all thread counts when limits are active. Only the
+parallel work on the parts and blocks requires more than two threads. Small
+tiles use sequential work. The plain path has no active limits and keeps its existing tile tasks.
+`VTMAKE_VERBOSE=1` also shows the time and RSS of each zoom pass with limits.

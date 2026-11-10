@@ -4,6 +4,7 @@
 //! Ported from tippecanoe. Copyright (c) 2022, Protomaps LLC;
 //! Copyright (c) 2014, Mapbox Inc. BSD 2-Clause: LICENSE-tippecanoe.md.
 
+use rayon::prelude::*;
 use crate::attrs::TileState;
 use crate::store::{Chunk, FeatMeta, Sorted};
 use vtmake_core::{AttrType, Draw, DrawVec, GeomType, VT_LINETO, VT_MOVETO};
@@ -14,7 +15,7 @@ use vtmake_geom::tile::{
     tile_simplify_early, tile_simplify_early_opts, tile_simplify_opts,
 };
 use vtmake_geom::{LayerRateDrop, NodeCtx, TinyPolyAccum};
-use vtmake_mvt::{MvtFeature, MvtLayer, MvtPoint, MvtTile, stringified_to_mvt_value};
+use vtmake_mvt::{MvtFeature, MvtLayer, MvtPoint, MvtTile, Src, stringified_fast, stringified_to_mvt_value};
 use crossbeam_channel::Sender;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -151,6 +152,7 @@ fn check_polygon(g: &mut DrawVec) {
 pub use crate::spool::Spool;
 
 pub struct Ctx<'a> {
+    pub selection: Option<&'a crate::selection::Selection>,
     // Variable depth: retain child input so a dropping retry can restore it.
     pub skip_tiles: std::sync::Mutex<std::collections::BTreeSet<(u8, u32, u32)>>,
     // The parent had rate drops or features waiting for a deeper zoom.
@@ -212,6 +214,12 @@ struct Scratch {
     g: DrawVec,
 }
 
+impl Scratch {
+    fn new() -> Self {
+        Self { geom: GeomScratch::default(), simplify: Default::default(), cleaner: vtmake_wagyu::Cleaner::new(), g: Vec::new() }
+    }
+}
+
 thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch {
         geom: GeomScratch::default(),
@@ -221,12 +229,55 @@ thread_local! {
     });
 }
 
+/// Rayon can run another tile while this tile waits for feature tasks.
+/// Release the thread-local borrow before that wait. The plain path keeps
+/// its existing scratch allocation and borrow.
+fn with_tile_scratch<T>(ctx: &Ctx, count: usize, f: impl FnOnce(&mut Scratch) -> T) -> T {
+    if ctx.pending.is_some() && count >= 2048 && rayon::current_num_threads() > 2 {
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.replace(Scratch::new());
+            let result = f(&mut scratch);
+            cell.replace(scratch);
+            result
+        })
+    } else { SCRATCH.with_borrow_mut(f) }
+}
+
 impl Ctx<'_> {
     #[inline]
     pub(crate) fn meta(&self, pos: u32) -> (&Chunk, &FeatMeta) {
         let s = self.order[pos as usize];
         let c = &self.chunks[s.chunk as usize];
         (c, &c.metas[s.local as usize])
+    }
+
+    /// Ask the CPU to load the metadata of `pos` into the cache.
+    #[inline]
+    pub(crate) fn prefetch_meta(&self, pos: u32) {
+        let s = self.order[pos as usize];
+        let p: *const FeatMeta = self.chunks[s.chunk as usize].metas.as_ptr().wrapping_add(s.local as usize);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch does not access memory; an address outside the
+        // vector has no effect.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = p;
+    }
+
+    /// Ask the CPU to load the attributes of `pos` into the cache.
+    #[inline]
+    pub(crate) fn prefetch_attrs(&self, pos: u32) {
+        let (c, m) = self.meta(pos);
+        let p = c.attrs.as_ptr().wrapping_add(m.attr_off as usize);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch does not access memory.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = p;
     }
 
     /// `-aP`: the label point quadkey of the feature.
@@ -314,6 +365,7 @@ pub(crate) struct Cand {
 /// Process tile (z, x, y), then its children. `feats` holds the candidates of this
 /// tile (in global sort order); their geometry is in `draws`.
 pub fn process(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>, draws: Vec<Draw>) {
+    if ctx.selection.is_some_and(|s| !s.descend(z, x, y)) { return; }
     if ctx.geo.plain { process_with::<true>(ctx, z, x, y, feats, draws) } else { process_with::<false>(ctx, z, x, y, feats, draws) }
 }
 
@@ -333,6 +385,11 @@ fn process_with<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>,
             }
     }
     if feats.is_empty() {
+        return;
+    }
+    // Limits need a zoom barrier. Keep their large geometry out of child arenas.
+    if P && ctx.pending.is_some() && !ctx.opts.additional[b't' as usize] {
+        process_limited(ctx, z, x, y, feats, draws);
         return;
     }
     let zu = z as u32;
@@ -371,7 +428,11 @@ fn process_with<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>,
     let mut gap_prev = 0;
     let (ox, oy) = tile_origin(zu, x, y);
     SCRATCH.with_borrow_mut(|s| {
-        for f in &feats {
+        for (i, f) in feats.iter().enumerate() {
+            // The metadata of a feature is a cache miss: load it early.
+            if let Some(n) = feats.get(i + 8) {
+                ctx.prefetch_meta(n.pos);
+            }
             let (_, m) = ctx.meta(f.pos);
             let mut gap = f.gap;
             if !ctx.gaps.is_empty() && gap == 0 && m.index != gap_prev {
@@ -394,6 +455,7 @@ fn process_with<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>,
                 let (x0, y0, x1, y1) = child_tile_range(&bbox, zu, nz as u32, x, y, ctx.buffer);
                 for cy in y0..=y1 {
                     for cx in x0..=x1 {
+                        if ctx.selection.is_some_and(|s| !s.descend(nz, cx, cy)) { continue; }
                         let k = &mut kids[((cx - 2 * x) + 2 * (cy - 2 * y)) as usize];
                         let start = k.1.len() as u32;
                         k.1.extend(s.g.iter().map(|d| {
@@ -445,7 +507,8 @@ fn process_with<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>,
     }
     if large_queue { crate::read::collect_free(); }
     // tippecanoe runs the shell filters also for a tile without candidates.
-    let prune = (!cands.is_empty() || (z >= ctx.minzoom && crate::plugin::active(ctx.opts))) && write_tile::<P>(ctx, z, x, y, &cands, &rel, (&nodes, &cand_nodes), future);
+    let selected = ctx.selection.is_none_or(|s| s.contains(z, x, y));
+    let prune = selected && (!cands.is_empty() || (z >= ctx.minzoom && crate::plugin::active(ctx.opts))) && write_tile::<P>(ctx, z, x, y, &cands, &rel, (&nodes, &cand_nodes), future);
     drop(rel);
     drop(cands);
     if !deeper || (prune && ctx.pending.is_none()) { return; }
@@ -483,17 +546,124 @@ fn process_with<const P: bool>(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>,
     });
 }
 
+/// One clip result. Low bits select children; bit 4 selects this tile.
+/// Keep one record until assembly instead of a candidate and child copies.
+struct Clipped {
+    gap: u64,
+    pos: u32,
+    start: u32,
+    len: u32,
+    flags: u8,
+}
+const _: () = assert!(std::mem::size_of::<Clipped>() == std::mem::size_of::<TF>());
+
+/// Clipping has no feature-order state. Each part uses its preceding source
+/// index for the density fallback, including when that feature clips away.
+/// Merge parts in source order. Tiny-polygon reduction stays in write_tile.
+fn process_limited(ctx: &Ctx, z: u8, x: u32, y: u32, feats: Vec<TF>, draws: Vec<Draw>) {
+    let zu = z as u32;
+    let nz = z + 1;
+    let deeper = (z as usize) < ctx.maxzoom.load(Ordering::Relaxed) || can_extend(ctx, z);
+    let (ox, oy) = tile_origin(zu, x, y);
+    let clip_part = |(part, fs): (usize, &[TF])| {
+        let mut rel = Vec::with_capacity(fs.iter().map(|f| f.len as usize).sum());
+        let mut records = Vec::with_capacity(fs.len());
+        let mut cands = 0usize;
+        let mut kids = [0usize; 4];
+        let mut any = false;
+        let mut prev = if part == 0 { 0 } else { ctx.meta(feats[part * CLIP_CHUNK - 1].pos).1.index };
+        SCRATCH.with_borrow_mut(|s| {
+            for f in fs {
+                let m = ctx.meta(f.pos).1;
+                let mut gap = f.gap;
+                if !ctx.gaps.is_empty() && gap == 0 && m.index != prev {
+                    let (px, py) = if ctx.opts.additional[b'h' as usize] { crate::defaults::decode_hilbert(prev) } else { vtmake_geom::decode_quadkey(prev) };
+                    for d in &draws[f.start as usize..(f.start + f.len) as usize] {
+                        let dx = px as i64 - d.x;
+                        let dy = py as i64 - d.y;
+                        gap = gap.max(dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy)) as u64);
+                    }
+                }
+                prev = m.index;
+                s.g.clear();
+                s.g.extend_from_slice(&draws[f.start as usize..(f.start + f.len) as usize]);
+                let Some(bbox) = clip::<true>(ctx, &mut s.g, m.geom_type, zu, x, y, &mut s.geom) else { continue; };
+                any |= z > ctx.minzoom || ctx.starts_at_minzoom || m.maxzoom < 0 || m.maxzoom as u8 >= z;
+                let start = rel.len() as u32;
+                let len = s.g.len() as u32;
+                rel.extend_from_slice(&s.g);
+                let mut flags = 0u8;
+                if deeper && len > 0 && (m.maxzoom < 0 || m.maxzoom as u8 >= nz) {
+                    let (x0, y0, x1, y1) = child_tile_range(&bbox, zu, nz as u32, x, y, ctx.buffer);
+                    for cy in y0..=y1 { for cx in x0..=x1 {
+                        if ctx.selection.is_some_and(|s| !s.descend(nz, cx, cy)) { continue; }
+                        let k = ((cx - 2*x) + 2*(cy - 2*y)) as usize;
+                        flags |= 1 << k;
+                        kids[k] += 1;
+                    } }
+                }
+                if z >= ctx.minzoom && (m.minzoom < 0 || z >= m.minzoom as u8) && (m.maxzoom < 0 || z <= m.maxzoom as u8) {
+                    flags |= 16;
+                    cands += 1;
+                }
+                if flags != 0 { records.push(Clipped { gap, pos: f.pos, start, len, flags }); }
+            }
+        });
+        (rel, records, cands, kids, any)
+    };
+    let parts: Vec<_> = if feats.len() >= CLIP_CHUNK * 2 && rayon::current_num_threads() > 2 {
+        feats.par_chunks(CLIP_CHUNK).enumerate().map(clip_part).collect()
+    } else {
+        feats.chunks(CLIP_CHUNK).enumerate().map(clip_part).collect()
+    };
+    // All clips are complete. Reuse the source allocation for the joined
+    // geometry, including when another Rayon thread allocated that memory.
+    let mut rel = draws;
+    rel.clear();
+    rel.reserve(parts.iter().map(|p| p.0.len()).sum());
+    let mut cands = Vec::with_capacity(parts.iter().map(|p| p.2).sum());
+    let sizes: [usize; 4] = std::array::from_fn(|i| parts.iter().map(|p| p.3[i]).sum());
+    let largest = (0..4).max_by_key(|&i| sizes[i]).unwrap();
+    // A child has at most one record per input feature. Reuse the input
+    // list for the largest child instead of allocating another large list.
+    let mut reused = if sizes[largest] > 0 { feats } else { drop(feats); Vec::new() };
+    reused.clear();
+    let mut kids: [Vec<TF>; 4] = std::array::from_fn(|i| {
+        if i == largest { std::mem::take(&mut reused) } else { Vec::with_capacity(sizes[i]) }
+    });
+    for (g, records, _, _, any) in parts {
+        let offset = rel.len() as u32;
+        rel.extend(g);
+        for f in records {
+            let start = f.start + offset;
+            if f.flags & 16 != 0 { cands.push(Cand { gap: f.gap, pos: f.pos, start, len: f.len }); }
+            for (i, out) in kids.iter_mut().enumerate() {
+                if f.flags & (1 << i) != 0 { out.push(TF { gap: f.gap, pos: f.pos, start, len: f.len }); }
+            }
+        }
+        if any { ctx.max_tiled.fetch_max(z as usize + 1, Ordering::Relaxed); }
+    }
+    {
+        for (i, fs) in kids.into_iter().enumerate() {
+            if !fs.is_empty() {
+                let task = Spool::encode_task_refs(nz, 2*x + (i as u32 & 1), 2*y + (i as u32 >> 1), &fs, &rel, (ox, oy), ctx.opts.geometry_scale);
+                // Never hold the queue mutex while waiting for Rayon work.
+                ctx.pending.as_ref().unwrap().lock().unwrap().push_encoded(task);
+            }
+        }
+    }
+    if ctx.selection.is_none_or(|s| s.contains(z, x, y)) && (!cands.is_empty() || (z >= ctx.minzoom && crate::plugin::active(ctx.opts))) {
+        write_tile::<true>(ctx, z, x, y, &cands, &rel, (&[], &[]), false);
+    }
+}
+
+const CLIP_CHUNK: usize = 16 * 1024;
+
 /// `unsimplified_geometry_size > 10 * 1024 * 1024` in `write_tile`, with
 /// `sizeof(draw)` = 16: the early simplification (spec 7.5).
 const EARLY_DRAWS: usize = 10 * 1024 * 1024 / 16;
 
-/// The last steps for one kept feature with its reduced geometry in `s.g`:
-/// simplify, scale, clean, then add it to its layer.
-#[allow(clippy::too_many_arguments)]
-fn emit<'a, const P: bool>(ctx: &'a Ctx, s: &mut Scratch, pos: u32, t: GeomType, zoom_detail: (u32, u32), reduced: bool, nodes: (&GeomOpts, &NodeCtx), layers: &mut BTreeMap<&'a str, MvtLayer>, vertices: &mut u64, collapsed_lines: &mut usize, ta: Option<&mut TileState<'a, '_>>) {
-    let (zu, line_detail) = zoom_detail;
-    let (chunk, m) = ctx.meta(pos);
-    let lname = ctx.layer_name(pos);
+fn finish_geometry<const P: bool>(ctx: &Ctx, s: &mut Scratch, t: GeomType, zu: u32, line_detail: u32, reduced: bool, nodes: (&GeomOpts, &NodeCtx), collapsed_lines: &mut usize) -> bool {
     let d = if P { line_detail } else { out_detail(ctx, zu, line_detail) };
     let tolerance = if line_detail > detail(ctx, zu) { 0.0 } else { simp::<P>(ctx, zu) };
     let pre: PolygonPre = if P {
@@ -521,23 +691,41 @@ fn emit<'a, const P: bool>(ctx: &'a Ctx, s: &mut Scratch, pos: u32, t: GeomType,
     }
     if s.g.is_empty() {
         if line_before_finish { *collapsed_lines += 1; }
-        return;
+        return false;
     }
+    true
+}
+
+/// The last steps for one kept feature with its reduced geometry in `s.g`:
+/// simplify, scale, clean, then add it to its layer.
+#[allow(clippy::too_many_arguments)]
+fn emit<'a, const P: bool, const FINISHED: bool>(ctx: &'a Ctx, s: &mut Scratch, pos: u32, t: GeomType, zoom_detail: (u32, u32), reduced: bool, nodes: (&GeomOpts, &NodeCtx), layers: &mut BTreeMap<&'a str, MvtLayer>, vertices: &mut u64, collapsed_lines: &mut usize, ta: Option<&mut TileState<'a, '_>>) {
+    let (zu, line_detail) = zoom_detail;
+    let (chunk, m) = ctx.meta(pos);
+    let lname = ctx.layer_name(pos);
+    let d = if P { line_detail } else { out_detail(ctx, zu, line_detail) };
+    if !FINISHED && !finish_geometry::<P>(ctx, s, t, zu, line_detail, reduced, nodes, collapsed_lines) { return; }
     let layer = layers.entry(lname).or_insert_with(|| {
         let mut l = MvtLayer::new(lname);
         l.extent = 1 << d;
         l
     });
-    let mut mf = MvtFeature { geom_type: t as u8, id: chunk.id(m), ..Default::default() };
+    let mut mf = MvtFeature { geom_type: t as u8, id: chunk.id(m), tags: Vec::with_capacity(2 * m.nattrs as usize), ..Default::default() };
     // With `-E` or `attribute-filter`, the tags come at the end of the tile.
     let deferred = ta.filter(|ta| ta.defers_tags()).map(|ta| ta.defer(pos, lname, layer.features.len())).is_some();
     if !deferred {
-        for (k, v) in chunk.attrs(m) {
-            let v = &chunk.vals[v as usize];
+        // All features of `layers` come from `ctx.chunks`.
+        let base = (ctx.order[pos as usize].chunk as u64 + 1) << 32;
+        for (k, vi) in chunk.attrs(m) {
+            let v = &chunk.vals[vi as usize];
             let key = &chunk.keys[k as usize];
+            let ks = Src { id: src_id(base, k, AttrType::String, key.as_bytes()), slot: chunk.key_slots[k as usize] };
+            let vs = Src { id: src_id(base, vi, v.ty, chunk.val_text(v).as_bytes()), slot: v.slot };
             match v.ty {
-                AttrType::String => layer.tag_str(&mut mf, key, chunk.val_text(v)),
+                AttrType::String => layer.tag_str_src(&mut mf, key, ks, chunk.val_text(v), vs),
                 AttrType::Null => {}
+                // `fast`: `stringified_fast` gives the value, with no warning.
+                ty if v.fast => layer.tag_src(&mut mf, key, ks, vs, || stringified_fast(ty, chunk.val_text(v)).unwrap()),
                 ty => {
                     if let Some(mv) = stringified_to_mvt_value(ty, chunk.val_text(v)) {
                         layer.tag(&mut mf, key, &mv);
@@ -549,6 +737,21 @@ fn emit<'a, const P: bool>(ctx: &'a Ctx, s: &mut Scratch, pos: u32, t: GeomType,
     mf.geometry.extend(s.g.iter().map(|d| MvtPoint { op: d.op, x: d.x, y: d.y }));
     *vertices += mf.geometry.len() as u64;
     layer.features.push(mf);
+}
+
+/// The source id of a key or value for the layer index (`vtmake_mvt::Src`).
+/// A text of up to 7 bytes: its type, length and bytes, so that the same text
+/// from all chunks has one id. Else (chunk + 1) << 32 | the key or value id
+/// in the chunk (the top bit is 0).
+#[inline]
+fn src_id(base: u64, id: u32, ty: AttrType, text: &[u8]) -> u64 {
+    if text.len() <= 7 {
+        let mut b = [0u8; 8];
+        b[..text.len()].copy_from_slice(text);
+        1 << 63 | (ty as u64) << 59 | (text.len() as u64) << 56 | u64::from_le_bytes(b)
+    } else {
+        base | id as u64
+    }
 }
 
 /// Return true only when a full-detail trial stops the child pyramid.
@@ -650,13 +853,19 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
     let (mut merge_prev, mut density_prev, mut density_gap, mut spacing) = (0u64, 0u64, 0., 0.);
     let mut cluster_counts = BTreeMap::<u32, u64>::new();
     let mut densities = BTreeMap::<u32, i64>::new();
-    SCRATCH.with_borrow_mut(|s| {
+    with_tile_scratch(ctx, cands.len(), |s| {
         // Buffered mode: the kept features (pos, type, reduced, start, len in `arena`).
         let mut kept: Vec<(u32, GeomType, bool, usize, usize)> = Vec::new();
         let mut arena: Vec<Draw> = Vec::new();
         let mut unsimplified = 0usize;
         let mut through = 0usize;
         for (seq, c) in cands.iter().enumerate() {
+            if let Some(n) = cands.get(seq + 16) {
+                ctx.prefetch_meta(n.pos);
+            }
+            if let Some(n) = cands.get(seq + 8) {
+                ctx.prefetch_attrs(n.pos);
+            }
             let feature_gap = c.gap;
             if let Some(ta) = ta.as_mut()
                 && !ta.admit(c.pos)
@@ -868,7 +1077,7 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
                 tile_nodes.extend_from_slice(&nodes[a as usize..(a + n) as usize]);
             }
             if !buffered {
-                emit::<P>(ctx, s, c.pos, t, (zu, d), r.reduced, (&gopts, &NodeCtx::EMPTY), &mut layers, &mut vertices, &mut collapsed_lines, ta.as_mut());
+                emit::<P, false>(ctx, s, c.pos, t, (zu, d), r.reduced, (&gopts, &NodeCtx::EMPTY), &mut layers, &mut vertices, &mut collapsed_lines, ta.as_mut());
                 continue;
             }
             // Spec 7.5: more than 10 MB of kept geometry in the tile. Simplify the
@@ -878,22 +1087,51 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
             kept.push((c.pos, t, r.reduced, arena.len(), s.g.len()));
             arena.extend_from_slice(&s.g);
             if unsimplified > EARLY_DRAWS && !ab {
-                for k in &mut kept[through..] {
+                let early = |scratch: &mut Scratch, k: &(u32, GeomType, bool, usize, usize)| {
                     let t = k.1;
-                    s.g.clear();
-                    s.g.extend_from_slice(&arena[k.3..k.3 + k.4]);
+                    scratch.g.clear();
+                    scratch.g.extend_from_slice(&arena[k.3..k.3 + k.4]);
                     if P {
-                        tile_simplify_early(&mut s.g, t, zu, d, SIMPLIFICATION, k.2, &mut s.geom);
+                        tile_simplify_early(&mut scratch.g, t, zu, d, SIMPLIFICATION, k.2, &mut scratch.geom);
                     } else {
                         let nc = NodeCtx { tile: &tile_nodes, global: &ctx.geo.nodes, tx: x, ty: y };
-                        tile_simplify_early_opts(&mut s.g, t, zu, d, simp::<P>(ctx, zu), k.2, &gopts, &nc, &mut s.geom);
+                        tile_simplify_early_opts(&mut scratch.g, t, zu, d, simp::<P>(ctx, zu), k.2, &gopts, &nc, &mut scratch.geom);
                     }
-                    if t == GeomType::Polygon && s.cleaner.coalesce_unscaled(&mut s.g).is_err() {
+                    if t == GeomType::Polygon && scratch.cleaner.coalesce_unscaled(&mut scratch.g).is_err() {
                         eprintln!("Internal error: Polygon cleaning failed. Log in /tmp/wagyu.log");
                         std::process::exit(106);
                     }
-                    (k.3, k.4) = (arena.len(), s.g.len());
-                    arena.extend_from_slice(&s.g);
+                    scratch.g.clone()
+                };
+                if ctx.pending.is_some() && kept.len() - through >= 2048 && rayon::current_num_threads() > 2 {
+                    // Local scratch avoids re-entering the caller's thread-local
+                    // scratch when Rayon runs a nested task on this thread.
+                    let results: Vec<_> = kept[through..].par_chunks(256).map(|ks| {
+                        let mut scratch = Scratch::new();
+                        ks.iter().map(|k| early(&mut scratch, k)).collect::<Vec<_>>()
+                    }).collect();
+                    for (k, g) in kept[through..].iter_mut().zip(results.into_iter().flatten()) {
+                        (k.3, k.4) = (arena.len(), g.len());
+                        arena.extend(g);
+                    }
+                } else {
+                    for k in &mut kept[through..] {
+                        let t = k.1;
+                        s.g.clear();
+                        s.g.extend_from_slice(&arena[k.3..k.3 + k.4]);
+                        if P {
+                            tile_simplify_early(&mut s.g, t, zu, d, SIMPLIFICATION, k.2, &mut s.geom);
+                        } else {
+                            let nc = NodeCtx { tile: &tile_nodes, global: &ctx.geo.nodes, tx: x, ty: y };
+                            tile_simplify_early_opts(&mut s.g, t, zu, d, simp::<P>(ctx, zu), k.2, &gopts, &nc, &mut s.geom);
+                        }
+                        if t == GeomType::Polygon && s.cleaner.coalesce_unscaled(&mut s.g).is_err() {
+                            eprintln!("Internal error: Polygon cleaning failed. Log in /tmp/wagyu.log");
+                            std::process::exit(106);
+                        }
+                        (k.3, k.4) = (arena.len(), s.g.len());
+                        arena.extend_from_slice(&s.g);
+                    }
                 }
                 through = kept.len();
                 unsimplified = 0;
@@ -960,6 +1198,22 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
                 arena[a.3..a.3 + a.4].iter().map(|d| (d.y, d.x)).cmp(arena[b.3..b.3 + b.4].iter().map(|d| (d.y, d.x)))
             }));
         }
+        // Selection and tiny-polygon accumulation are complete. Geometry has
+        // no cross-feature state now. Keep tags and layer tables in order.
+        let finished = if ctx.pending.is_some() && kept.len() >= 2048 && rayon::current_num_threads() > 2
+            && limit == 0 && merged.is_empty() && !ctx.geo.check_polygons {
+            Some(kept.par_chunks(256).map(|ks| {
+                let mut scratch = Scratch::new();
+                ks.iter().map(|&(_, t, reduced, start, len)| {
+                    scratch.g.clear();
+                    scratch.g.extend_from_slice(&arena[start..start + len]);
+                    let mut collapsed = 0;
+                    finish_geometry::<P>(ctx, &mut scratch, t, zu, d, reduced, (&gopts, &nc), &mut collapsed);
+                    (scratch.g.clone(), collapsed)
+                }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>().into_iter().flatten().collect::<Vec<_>>())
+        } else { None };
+        let mut finished = finished.map(Vec::into_iter);
         for &(pos, t, reduced, start, len) in &kept {
             if limit > 0 {
                 let n = counts.entry(ctx.layer_name(pos)).or_insert(0usize);
@@ -977,7 +1231,15 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
             }
             let lname = ctx.layer_name(pos);
             let before = layers.get(lname).map_or(0, |l| l.features.len());
-            emit::<P>(ctx, s, pos, t, (zu, d), reduced, (&gopts, &nc), &mut layers, &mut vertices, &mut collapsed_lines, ta.as_mut());
+            if let Some(finished) = &mut finished {
+                let (g, collapsed) = finished.next().unwrap();
+                collapsed_lines += collapsed;
+                s.g = g;
+                if s.g.is_empty() { continue; }
+                emit::<P, true>(ctx, s, pos, t, (zu, d), reduced, (&gopts, &nc), &mut layers, &mut vertices, &mut collapsed_lines, ta.as_mut());
+            } else {
+                emit::<P, false>(ctx, s, pos, t, (zu, d), reduced, (&gopts, &nc), &mut layers, &mut vertices, &mut collapsed_lines, ta.as_mut());
+            }
             if layers.get(lname).is_some_and(|l| l.features.len() > before) {
                 if multiplier { multiplier_tags.push((lname, before, pos)); }
                 let clustered = cluster_counts.get(&pos).copied().unwrap_or(0);
@@ -1067,8 +1329,9 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
     let tile = MvtTile { layers: layers.into_values().collect() };
     let mut pbf = Vec::with_capacity(4096);
     tile.encode(&mut pbf);
+    let unchanged = ctx.selection.is_some_and(|s| s.record(z, x, y, &pbf));
     let mut gz = Vec::with_capacity(pbf.len() / 2 + 64);
-    ctx.gzip.compress(&pbf, &mut gz);
+    if !unchanged { ctx.gzip.compress(&pbf, &mut gz); }
     let size = (gz.len() * (kept_count + skipped_count)).checked_div(kept_count).unwrap_or(gz.len());
     if !ctx.opts.prevent[b'k' as usize] && size > adjusted_limit(ctx.opts.max_tile_size as usize, multiplier_lead_count, multiplier_other_count) {
         ctx.strategies[z as usize][4].fetch_max(size as u64, Ordering::Relaxed);
@@ -1091,7 +1354,9 @@ pub(crate) fn write_tile_detail<const P: bool, const MULTIPLIER: bool>(ctx: &Ctx
         }
     }
     ctx.tiles.fetch_add(1, Ordering::Relaxed);
-    if ctx.pending.is_some() { ctx.staged.lock().unwrap().push_tile((z, x, y, gz)); } else { ctx.out.send((z, x, y, gz)).expect("writer stopped"); }
+    if !unchanged {
+        if ctx.pending.is_some() { ctx.staged.lock().unwrap().push_tile((z, x, y, gz)); } else { ctx.out.send((z, x, y, gz)).expect("writer stopped"); }
+    }
     if trial { 3 } else { 1 }
 }
 
@@ -1168,7 +1433,12 @@ pub fn process_zoom(ctx: &Ctx, tasks: &mut Spool) {
     let initial = crate::drop::Threshold { gap: 0, sequence: 0, extent: 0, attribute: 0, gamma: ctx.opts.gamma };
     *ctx.drop_state.lock().unwrap() = (initial, initial);
     let mut z = 0;
+    let verbose = std::env::var_os("VTMAKE_VERBOSE").is_some();
+    let start = std::time::Instant::now();
+    let mut pass = 0;
     loop {
+        let pass_start = std::time::Instant::now();
+        pass += 1;
         ctx.still_dropping.store(false, Ordering::Relaxed);
         let before = ctx.drop_state.lock().unwrap().0;
         let tile_count = ctx.tiles.load(Ordering::Relaxed);
@@ -1189,6 +1459,11 @@ pub fn process_zoom(ctx: &Ctx, tasks: &mut Spool) {
             });
             crate::read::collect_free();
             if ctx.incomplete.load(Ordering::Relaxed) { break; }
+        }
+        if verbose {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let rss = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap_or("");
+            eprintln!("zoom {z} pass {pass}: {:.3}s (total {:.3}s), {rss}", pass_start.elapsed().as_secs_f64(), start.elapsed().as_secs_f64());
         }
         let after = ctx.drop_state.lock().unwrap().1;
         if ctx.still_dropping.load(Ordering::Relaxed) && can_extend(ctx, z) {

@@ -207,29 +207,46 @@ impl<'a> StreamParser<'a> {
         }
     }
     fn geometry(&mut self, p: &mut json::Parser<'a>) -> Option<()> {
-        take(p, b'{')?;
-        if string(p)? != "type" {
-            return None;
-        }
-        take(p, b':')?;
-        let (kind, depth) = match string(p)?.as_ref() {
-            "Point" => (GeomType::Point, 0),
-            "MultiPoint" => (GeomType::Point, 1),
-            "LineString" => (GeomType::Line, 1),
-            "MultiLineString" => (GeomType::Line, 2),
-            "Polygon" => (GeomType::Polygon, 2),
-            "MultiPolygon" => (GeomType::Polygon, 3),
-            _ => return None,
-        };
-        take(p, b',')?;
-        if string(p)? != "coordinates" {
-            return None;
-        }
-        take(p, b':')?;
-        self.feature.geom_type = kind;
-        coords(p, depth, kind, VT_MOVETO, &mut self.feature.geom)?;
-        take(p, b'}')
+        geometry(p, &mut self.feature)
     }
+}
+
+/// Read a geometry object whose members are `type`, then `coordinates` (the
+/// order of PostGIS `ST_AsGeoJSON`) into `feature.geom_type` and
+/// `feature.geom` (appended). `false`: the reference parser must read it;
+/// `feature.geom` then has no meaning.
+pub fn parse_geometry(text: &str, feature: &mut ParsedFeature) -> bool {
+    let mut p = json::Parser { s: text, i: 0 };
+    if geometry(&mut p, feature).is_none() {
+        return false;
+    }
+    p.space();
+    p.i == text.len()
+}
+
+fn geometry(p: &mut json::Parser<'_>, feature: &mut ParsedFeature) -> Option<()> {
+    take(p, b'{')?;
+    if string(p)? != "type" {
+        return None;
+    }
+    take(p, b':')?;
+    let (kind, depth) = match string(p)?.as_ref() {
+        "Point" => (GeomType::Point, 0),
+        "MultiPoint" => (GeomType::Point, 1),
+        "LineString" => (GeomType::Line, 1),
+        "MultiLineString" => (GeomType::Line, 2),
+        "Polygon" => (GeomType::Polygon, 2),
+        "MultiPolygon" => (GeomType::Polygon, 3),
+        _ => return None,
+    };
+    take(p, b',')?;
+    if string(p)? != "coordinates" {
+        return None;
+    }
+    take(p, b':')?;
+    feature.geom_type = kind;
+    coords(p, depth, kind, VT_MOVETO, &mut feature.geom)?;
+    take(p, b'}')
 }
 fn string<'a>(p: &mut json::Parser<'a>) -> Option<Cow<'a, str>> {
     p.space();
@@ -304,7 +321,8 @@ fn coords(
     Some(())
 }
 
-fn attribute_number(raw: &str) -> Cow<'_, str> {
+/// The attribute text of a JSON number (the fast parser's rule).
+pub(crate) fn attribute_number(raw: &str) -> Cow<'_, str> {
     // Small integers already have the required text. Keep negative zero on the reference path.
     if raw.len() <= 15
         && raw != "-0"

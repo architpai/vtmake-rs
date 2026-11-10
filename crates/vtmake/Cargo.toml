@@ -26,3 +26,8 @@ vtmake-geom = { path = "../vtmake-geom" }
 vtmake-wagyu = { path = "../vtmake-wagyu" }
 vtmake-tools = { path = "../vtmake-tools" }
 vtmake-filter = { path = "../vtmake-filter" }
+blake3 = "1"
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = "1"

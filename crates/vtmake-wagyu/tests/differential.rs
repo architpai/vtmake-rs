@@ -92,10 +92,84 @@ fn split_and_empty() {
     compare(&mut c, &geom, true);
 }
 #[test]
+fn simple_ring_adversarial() {
+    let mut c = Cleaner::new();
+    let mut shapes = vec![
+        vec![(0, 0), (40, 0), (40, 10), (10, 10), (10, 40), (0, 40)],
+        vec![
+            (0, 0),
+            (40, 0),
+            (40, 40),
+            (30, 40),
+            (30, 10),
+            (10, 10),
+            (10, 40),
+            (0, 40),
+        ],
+        vec![(0, 0), (40, 0), (40, 40), (20, 1), (0, 40)],
+        vec![(0, 0), (40, 0), (20, 0), (40, 40), (0, 40)],
+        vec![(0, 0), (20, 0), (40, 0), (40, 40), (0, 40)],
+        vec![(0, 0), (40, 0), (40, 0), (40, 40), (0, 40)],
+        vec![(0, 0), (40, 0), (40, 40), (20, 0), (0, 40)],
+        vec![(0, 0), (40, 40), (0, 40), (40, 0)],
+        vec![(0, 0), (10, 10), (20, 0), (30, 20), (-10, 20)],
+        vec![
+            (0, 0),
+            (10, 10),
+            (20, 0),
+            (30, 10),
+            (40, 0),
+            (50, 30),
+            (-10, 30),
+        ],
+    ];
+    for n in [64, 65] {
+        shapes.push(
+            (0..n)
+                .map(|i| {
+                    let angle = i as f64 * std::f64::consts::TAU / n as f64;
+                    let r = if i % 2 == 0 { 10000. } else { 7000. };
+                    (
+                        (angle.cos() * r).round() as i64,
+                        (angle.sin() * r).round() as i64,
+                    )
+                })
+                .collect(),
+        );
+    }
+    for points in shapes {
+        for offset in [
+            -(1 << 38) + 10000,
+            -(1 << 20) - 1,
+            -100,
+            0,
+            (1 << 20) - 10000,
+            (1 << 38) - 10000,
+        ] {
+            for reverse in [false, true] {
+                for start in 0..points.len() {
+                    let n = points.len();
+                    let mut geom = Vec::new();
+                    for i in 0..=n {
+                        let p = points[(start + if reverse { n - i % n } else { i }) % n];
+                        let mut d =
+                            Draw::new(if i == 0 { 1 } else { 2 }, p.0 + offset, p.1 + offset);
+                        d.necessary = true;
+                        geom.push(d);
+                    }
+                    compare(&mut c, &geom, false);
+                    geom.push(Draw::new(7, 0, 0));
+                    compare(&mut c, &geom, false);
+                }
+            }
+        }
+    }
+}
+#[test]
 #[ignore = "Set VTMAKE_CORPUS to public polygon NDJSON"]
 fn corpus_polygons() {
-    use vtmake_parse::{ParsedLine, parse_feature};
     use std::io::BufRead;
+    use vtmake_parse::{ParsedLine, parse_feature};
     let Ok(path) = std::env::var("VTMAKE_CORPUS") else {
         eprintln!("VTMAKE_CORPUS not set: skip");
         return;

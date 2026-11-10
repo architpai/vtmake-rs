@@ -41,7 +41,7 @@ const PARSE_MIN: u64 = if cfg!(test) { 20 } else { 10_000_000 };
 const SPILL: u64 = if cfg!(test) { 300 } else { 512 * 1024 * 1024 };
 
 /// One read from the input.
-const BLOCK: usize = if cfg!(test) { 7 } else { 4 * 1024 * 1024 };
+pub(super) const BLOCK: usize = if cfg!(test) { 7 } else { 4 * 1024 * 1024 };
 
 /// The size of a window of GeoJSON text.
 fn window_size(threads: usize) -> usize {
@@ -60,7 +60,7 @@ fn piece_size(threads: usize) -> u64 {
 }
 
 /// The bytes of a source.
-struct Input<'a> {
+pub(super) struct Input<'a> {
     r: Box<dyn Read + Send + 'a>,
     /// A read error stops with this message and exit 114 (gzip); else it
     /// ends the input (as `fread`).
@@ -72,7 +72,7 @@ struct Input<'a> {
 impl<'a> Input<'a> {
     /// `gz`: decompress if the input starts with the gzip magic bytes
     /// (zlib's `gzread` reads other data as it is).
-    fn new(file: &'a mut std::fs::File, gz: bool, open_error: Option<&'a str>) -> Self {
+    pub(super) fn new(file: &'a mut std::fs::File, gz: bool, open_error: Option<&'a str>) -> Self {
         let mut head = Vec::new();
         let mut inp = Input { r: Box::new(std::io::empty()), gz: false, open_error };
         if gz {
@@ -98,7 +98,7 @@ impl<'a> Input<'a> {
     }
 
     /// Read `n` more bytes into `buf`; `Ok(true)` at the end of the input.
-    fn fill(&mut self, buf: &mut Vec<u8>, n: usize) -> Result<bool, ()> {
+    pub(super) fn fill(&mut self, buf: &mut Vec<u8>, n: usize) -> Result<bool, ()> {
         buf.reserve(n);
         match (&mut self.r).take(n as u64).read_to_end(buf) {
             Ok(k) => Ok(k < n),
@@ -418,7 +418,7 @@ fn serial_window(fx: &mut Fixer<'_>, w: &Window, wbase: u64, ro: &ReadOpts, fnam
 }
 
 /// The size of a block of CSV or FlatGeobuf input, and of its pieces.
-fn block_size(threads: usize) -> (usize, usize) {
+pub(super) fn block_size(threads: usize) -> (usize, usize) {
     if cfg!(test) {
         return (40, 9);
     }
@@ -438,7 +438,7 @@ struct Parsed {
 /// `f(j, w)` for `j` in `0..n`, in parallel: worker thread `w = j % threads`
 /// runs `f(j, w)`. The parse and the build of a piece run on the same
 /// thread, so the thread that allocates the parsed features also frees them.
-fn pinned<R: Send>(n: usize, f: impl Fn(usize, usize) -> R + Sync) -> Vec<R> {
+pub(super) fn pinned<R: Send>(n: usize, f: impl Fn(usize, usize) -> R + Sync) -> Vec<R> {
     let parts: Vec<Vec<(usize, R)>> = rayon::broadcast(|ctx| (ctx.index()..n).step_by(ctx.num_threads()).map(|j| (j, f(j, ctx.index()))).collect());
     let mut out: Vec<Option<R>> = (0..n).map(|_| None).collect();
     for (j, r) in parts.into_iter().flatten() {
@@ -450,7 +450,7 @@ fn pinned<R: Send>(n: usize, f: impl Fn(usize, usize) -> R + Sync) -> Vec<R> {
 /// The chunk builders of the worker threads. Each thread adds the features
 /// of its pieces to its own chunk (the order of the features in a chunk
 /// does not matter: `seq` gives the order), so the chunks are large.
-struct Builders<'a> {
+pub(super) struct Builders<'a> {
     ro: &'a ReadOpts,
     base: u64,
     open: Vec<std::sync::Mutex<Option<Builder>>>,
@@ -458,7 +458,7 @@ struct Builders<'a> {
 }
 
 impl<'a> Builders<'a> {
-    fn new(ro: &'a ReadOpts, base: u64) -> Self {
+    pub(super) fn new(ro: &'a ReadOpts, base: u64) -> Self {
         Builders { ro, base, open: (0..rayon::current_num_threads()).map(|_| std::sync::Mutex::new(None)).collect(), done: Default::default() }
     }
 
@@ -486,7 +486,21 @@ impl<'a> Builders<'a> {
         });
     }
 
-    fn finish(self) -> Vec<Chunk> {
+    /// Run `f` with the chunk builder of worker thread `w` (see [`pinned`]).
+    /// `f` calls `full` after each feature: a full builder is finished.
+    pub(super) fn with<R>(&self, w: usize, f: impl FnOnce(&mut Builder, &dyn Fn(&mut Builder)) -> R) -> R {
+        let mut open = self.open[w % self.open.len()].lock().unwrap();
+        let b = open.get_or_insert_with(|| Builder::new(self.ro.projection, self.ro.geometry_scale));
+        let full = |b: &mut Builder| {
+            if b.full() {
+                let c = std::mem::replace(b, Builder::new(self.ro.projection, self.ro.geometry_scale)).finish();
+                self.done.lock().unwrap().push(c);
+            }
+        };
+        f(b, &full)
+    }
+
+    pub(super) fn finish(self) -> Vec<Chunk> {
         let mut out = self.done.into_inner().unwrap();
         out.extend(self.open.into_iter().filter_map(|b| b.into_inner().unwrap()).map(Builder::finish));
         out.retain(|c| !c.metas.is_empty());
@@ -709,6 +723,7 @@ mod tests {
             felt_cpus: cpus,
             empty_csv_null: false,
             quiet: true,
+            pgcopy: None,
         }
     }
 

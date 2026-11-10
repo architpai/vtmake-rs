@@ -1,5 +1,4 @@
 //! Polygon union with the Wagyu headers from tippecanoe.
-use vtmake_core::{Draw, DrawVec, VT_CLOSEPATH, VT_LINETO, VT_MOVETO};
 use std::{
     ffi::c_void,
     ptr::NonNull,
@@ -8,6 +7,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use vtmake_core::{Draw, DrawVec, VT_CLOSEPATH, VT_LINETO, VT_MOVETO};
+
+#[doc(hidden)]
+pub mod simple;
+mod stats;
+
+pub use stats::print_statistics;
 
 static MODE: OnceLock<String> = OnceLock::new();
 static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -81,7 +87,11 @@ impl Cleaner {
     pub fn clean(&mut self, geom: &[Draw], out: &mut DrawVec) -> Result<(), CleanError> {
         let mode = MODE.get_or_init(|| std::env::var("VTMAKE_WAGYU_MODE").unwrap_or_default());
         if mode != "full" {
-            let hit = convex_ring(geom, out);
+            let convex_hit = convex_ring(geom, out);
+            if mode == "stats" {
+                stats::record(geom, convex_hit);
+            }
+            let hit = convex_hit || simple::simple_ring(geom, out);
             if mode == "verify" {
                 CALLS.fetch_add(1, Ordering::Relaxed);
                 let mut expected = Vec::new();
@@ -115,7 +125,13 @@ impl Cleaner {
     /// [`Cleaner::clean_scaled`], so that the usual path stays the same.
     #[cold]
     #[inline(never)]
-    pub fn clean_clipped(&mut self, geom: &[Draw], out: &mut DrawVec, z: u32, buffer: i64) -> Result<(), CleanError> {
+    pub fn clean_clipped(
+        &mut self,
+        geom: &[Draw],
+        out: &mut DrawVec,
+        z: u32,
+        buffer: i64,
+    ) -> Result<(), CleanError> {
         let area: i64 = if z == 0 { 0xFFFF_FFFF } else { 1 << (32 - z) };
         let clip_buffer = buffer * area / 256;
         self.scratch.clear();
@@ -156,33 +172,56 @@ impl Cleaner {
         let mut ptr = std::ptr::null();
         let mut len = 0;
         // SAFETY: all slices and context are valid until this call returns.
-        let status = unsafe { vtmake_wagyu_union_clip(self.context.as_ptr(), self.input.as_ptr(), self.input.len() / 3, -clip_buffer, area + clip_buffer, &mut ptr, &mut len) };
+        let status = unsafe {
+            vtmake_wagyu_union_clip(
+                self.context.as_ptr(),
+                self.input.as_ptr(),
+                self.input.len() / 3,
+                -clip_buffer,
+                area + clip_buffer,
+                &mut ptr,
+                &mut len,
+            )
+        };
         if status != 0 {
             return Err(CleanError);
         }
         // SAFETY: the context owns len entries. Do not call the shim while borrowed.
-        let data = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(ptr, len) } };
+        let data = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        };
         // Each ring ends at its first point (`close_ring`, not called here).
         out.clear();
         let mut start = 0;
         for p in data.as_chunks::<3>().0 {
             let draw = Draw::new(p[0] as u8, p[1], p[2]);
             if draw.op == VT_MOVETO {
-                if start < out.len() && (out[start].x, out[start].y) != (out[out.len() - 1].x, out[out.len() - 1].y) {
+                if start < out.len()
+                    && (out[start].x, out[start].y) != (out[out.len() - 1].x, out[out.len() - 1].y)
+                {
                     out.push(Draw::new(VT_LINETO, out[start].x, out[start].y));
                 }
                 start = out.len();
             }
             out.push(draw);
         }
-        if start < out.len() && (out[start].x, out[start].y) != (out[out.len() - 1].x, out[out.len() - 1].y) {
+        if start < out.len()
+            && (out[start].x, out[start].y) != (out[out.len() - 1].x, out[out.len() - 1].y)
+        {
             out.push(Draw::new(VT_LINETO, out[start].x, out[start].y));
         }
         Ok(())
     }
     /// The full path with a start scale: 16 (`try_scaling`, then 1 if needed)
     /// or 1 (no scaling, for world coordinates).
-    fn clean_scaled(&mut self, geom: &[Draw], out: &mut DrawVec, mut scale: i32) -> Result<(), CleanError> {
+    fn clean_scaled(
+        &mut self,
+        geom: &[Draw],
+        out: &mut DrawVec,
+        mut scale: i32,
+    ) -> Result<(), CleanError> {
         self.scratch.clear();
         let mut last = (0., 0.);
         for &d in geom {

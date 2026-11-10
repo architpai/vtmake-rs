@@ -81,6 +81,9 @@ pub struct SetValue {
 /// All settings of the command line, with tippecanoe's defaults.
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub only_tiles: Option<String>,
+    pub known_hashes: Option<String>,
+    pub hashes_out: Option<String>,
     pub argv: Vec<String>,
     pub output: Output,
     pub force: bool,
@@ -152,6 +155,9 @@ pub struct Options {
     pub json_progress: bool,
     pub progress_interval: f64,
     pub unidecode_data: Option<String>,
+    /// `--pgcopy-schema`: the schema (JSON text or a file name) of the
+    /// Postgres binary COPY input.
+    pub pgcopy_schema: Option<String>,
     /// `-p` letters (`prevent[]`) and `-a` letters (`additional[]`).
     pub prevent: [bool; 128],
     pub additional: [bool; 128],
@@ -215,6 +221,9 @@ static OPTIONS: &[Opt] = &[
     s("named-layer", true, 'L'),
     h("Parallel processing of input"),
     s("read-parallel", false, 'P'),
+    t("only-tiles"),
+    t("known-hashes"),
+    t("hashes-out"),
     h("Projection of input"),
     s("projection", true, 's'),
     h("Zoom levels"),
@@ -343,6 +352,8 @@ static OPTIONS: &[Opt] = &[
     ad("prefer-radix-sort", b'R'),
     t("unidecode-data"),
     s("help", false, 'H'),
+    // vtmake: read Postgres binary COPY input (docs/pgcopy.md).
+    t("pgcopy-schema"),
 ];
 
 /// `print_usage` (`usage.cpp`) for tippecanoe's table.
@@ -545,6 +556,9 @@ pub fn parse(argv: Vec<String>) -> Options {
         minzoom: 0,
         guess_maxzoom: false,
         minimum_maxzoom: 0,
+        only_tiles: None,
+        known_hashes: None,
+        hashes_out: None,
         extend_zooms_max: 0,
         one_tile: None,
         full_detail: -1,
@@ -596,6 +610,7 @@ pub fn parse(argv: Vec<String>) -> Options {
         json_progress: false,
         progress_interval: 0.0,
         unidecode_data: None,
+        pgcopy_schema: None,
         prevent: [false; 128],
         additional: [false; 128],
         geometry_scale: 0,
@@ -641,9 +656,13 @@ pub fn parse(argv: Vec<String>) -> Options {
             '~' => {
                 let opt = table[option_index].name;
                 match opt {
+                    "only-tiles" => o.only_tiles = Some(v.clone()),
+                    "known-hashes" => o.known_hashes = Some(v.clone()),
+                    "hashes-out" => o.hashes_out = Some(v.clone()),
                     "tile-stats-attributes-limit" => o.tilestats_attributes_limit = atoll(&v) as i32 as i64,
                     "tile-stats-sample-values-limit" => o.tilestats_sample_values_limit = atoll(&v) as i32 as i64,
                     "tile-stats-values-limit" => o.tilestats_values_limit = atoll(&v) as i32 as i64,
+                    "pgcopy-schema" => o.pgcopy_schema = Some(v.clone()),
                     "clip-bounding-box" => {
                         // `sscanf("%lf,%lf,%lf,%lf")`.
                         let mut rest = v.as_str();
@@ -1124,6 +1143,7 @@ pub fn check_supported(o: &Options) {
     // the progress display, which vtmake does not have. `-t` selects the
     // directory for the disk queues when tile limits are active.
     const DONE: &[&str] = &[
+        "--only-tiles", "--known-hashes", "--hashes-out",
         "--output",
         "--output-to-directory",
         "--force",
@@ -1256,6 +1276,7 @@ pub fn check_supported(o: &Options) {
         "--tile-stats-attributes-limit",
         "--tile-stats-sample-values-limit",
         "--tile-stats-values-limit",
+        "--pgcopy-schema",
     ];
     for g in &o.given {
         if !DONE.contains(&g.as_str()) {

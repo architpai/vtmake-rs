@@ -25,6 +25,12 @@ Wagyu (mapbox/wagyu 0.5.0) and mapbox/geometry.hpp, mapbox/variant
   ISC / BSD licences: crates/vtmake-wagyu/vendor/mapbox/LICENSE-*
   Used: polygon cleaning (vendored C++ headers, called through FFI).
 
+manby (birkskyum/manby, https://github.com/birkskyum/manby)
+  Copyright (c) 2026, Birk Skyum
+  BSD 2-Clause licence: crates/vtmake-wagyu/LICENSE-manby.md
+  Used: the conservative simple-ring test, adapted in
+  crates/vtmake-wagyu/src/simple.rs.
+
 zlib 1.3.1
   Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
   zlib licence: crates/vtmake-zlib/zlib/LICENSE

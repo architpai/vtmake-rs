@@ -46,9 +46,9 @@ taskset -c 2-31 cargo run --release -p vtmake-wagyu --features reference \
 `Cleaner::clean` can bypass C++ for one closed convex outer ring with 3 to 16
 vertices. A final CLOSEPATH is permitted. All coordinates must be within
 ±2^20. For each directed edge, every other vertex must be strictly to its left,
-and the cross product must exceed `abs(dx) + abs(dy)`. Other inputs use the full
-wrapper without a change. In particular, holes, multiple rings, negative rings,
-duplicate points, collinear points, and spikes use C++.
+and the cross product must exceed `abs(dx) + abs(dy)`. Other inputs continue to
+the simple-ring test below. Holes, multiple rings, duplicate points, collinear
+points, and spikes use C++.
 
 The supporting half-plane tests prove convexity, positive winding, and no
 intersection. They also put each nonincident vertex outside the square of
@@ -74,3 +74,50 @@ run the full wrapper on every cleaning call and compare every fast result as a
 complete DrawVec. A mismatch stops the process. The `tippecanoe` binary prints
 the call count and hit count at the end. Verification stores no source data.
 `Cleaner::clean_full` is also available for differential tests.
+
+## Simple ring fast path
+
+After the convex test, `Cleaner::clean` tests one closed ring with 3 to 64
+vertices. A final CLOSEPATH is permitted. Coordinates, including CLOSEPATH
+coordinates, must be within ±2^20. The test rejects equal consecutive points,
+collinear turns, crossings, and repeated vertices. It also rejects more than
+two vertices at the smallest y. Other input uses C++.
+
+For each edge, the test first checks the bounding box of each nonincident
+vertex, expanded by one unit. Within that box, it rejects a vertex if the
+absolute cross product is at most `abs(dx) + abs(dy)`. If an edge meets the
+square of radius one about a vertex, both conditions hold. This test can
+reject extra rings, but it cannot accept an edge that meets that square.
+Nonadjacent edges also get a segment crossing test. Together these tests
+exclude crossings, touches, repeated vertices, and hot-pixel changes.
+
+`build_edges.hpp` removes no vertices because no consecutive points are equal
+or collinear. The simple ring has no intersections that can make new hot
+pixels. No nonincident edge can meet a vertex's hot-pixel square at scale 16;
+its radius is only one half in scaled units. The output thus has only input
+vertices at multiples of 16. The scale-1 retry cannot occur. The one-unit
+margin also excludes hot-pixel changes at scale 1.
+
+A positive simple ring has winding count one inside and zero outside. Positive
+union keeps its boundary. The sweep can join temporary bounds at local extrema,
+but it cannot split this boundary or create a hole. The last left-bound point
+sets `ring->points` at the smallest y. With two such points, the sweep keeps
+the larger x. `build_result.hpp` walks `prev` in the positive input direction
+and adds the first point as the closing point. The Rust path makes this same
+sequence. A negative simple ring has winding count minus one inside. Positive
+fill keeps no interior, so both paths return an empty result. The tests check
+both directions and all start points for L and U shapes.
+
+The Rust path uses `Draw::new` to clear every `necessary` flag. All differences,
+cross products, and the sum of at most 64 area terms fit within i64 at ±2^20.
+At scale 16 the C++ products and sums are exact multiples of 256 within the
+double precision limit for those multiples. The test uses no floating-point
+arithmetic. Each cleaner has its own output buffer.
+
+`VTMAKE_WAGYU_MODE=verify` checks both Rust paths against the full wrapper.
+Set `VTMAKE_WAGYU_MODE=stats` to print aggregate counts at the end of a build.
+The counts describe misses from the original convex path: single or multiple
+rings, negative rings, convex or non-convex rings, and vertex counts in six
+bins (at most 3, 4–16, 17–32, 33–64, 65–128, and more than 128). A negative
+ring can be a hole or an isolated clockwise ring. These counts store no source
+coordinates. Both diagnostic modes add work; do not use them for speed tests.

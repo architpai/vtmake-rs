@@ -6,6 +6,8 @@ pub mod pull;
 pub mod geojson;
 pub mod csv;
 pub mod fgb;
+pub mod js;
+pub mod pgcopy;
 use vtmake_core::{Attr, AttrType, Draw, Feature, GeomType, VT_CLOSEPATH, VT_LINETO, VT_MOVETO};
 use json::Value;
 use rayon::prelude::*;
