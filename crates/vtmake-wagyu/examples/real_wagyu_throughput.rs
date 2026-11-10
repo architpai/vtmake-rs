@@ -1,7 +1,7 @@
+use std::{io::BufRead, time::Instant};
 use vtmake_core::Draw;
 use vtmake_parse::{ParsedLine, parse_feature};
 use vtmake_wagyu::Cleaner;
-use std::{io::BufRead, time::Instant};
 #[cfg(feature = "reference")]
 unsafe extern "C" {
     fn bt_reference(

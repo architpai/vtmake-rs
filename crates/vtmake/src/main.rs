@@ -21,6 +21,7 @@ mod read;
 mod store;
 mod spool;
 mod tile;
+mod selection;
 
 use vtmake_out::{DirWriter, MbtilesWriter, TileSink};
 use rayon::prelude::*;
@@ -185,6 +186,7 @@ fn build(argv: Vec<String>) {
     let t0 = Instant::now();
     let mut opts = cli::parse(argv);
     cli::check_supported(&opts);
+    let selection = selection::Selection::load(&opts).unwrap_or_else(|e| { eprintln!("vtmake build: {e}"); std::process::exit(101) });
     attrs::init(&opts);
     filter::init(opts.filter.as_deref());
     let gzip = if opts.prevent[b'C' as usize] { vtmake_mvt::gzip::Mode::None } else { gzip_mode() };
@@ -243,6 +245,18 @@ fn build(argv: Vec<String>) {
         felt_cpus: read::felt_cpus(),
         empty_csv_null: opts.prevent[b'e' as usize],
         quiet: opts.quiet,
+        pgcopy: opts.pgcopy_schema.as_deref().map(|s| {
+            // Inline JSON, or the name of a JSON file.
+            let text = if s.trim_start().starts_with('{') {
+                s.to_string()
+            } else {
+                std::fs::read_to_string(s).unwrap_or_else(|e| {
+                    eprintln!("{s}: {}", os_error(&e));
+                    std::process::exit(EXIT_OPEN)
+                })
+            };
+            std::sync::Arc::new(vtmake_parse::pgcopy::Schema::from_json(&text, opts.minzoom, opts.maxzoom).unwrap_or_else(|e| e.exit()))
+        }),
     };
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_layer: Vec<String> = Vec::new();
@@ -274,6 +288,9 @@ fn build(argv: Vec<String>) {
         // As tippecanoe: close the output with no tiles and no metadata.
         eprintln!("Did not read any valid geometries");
         sink.finish(&Vec::new()).expect("finish output");
+        // A header-only manifest: no produced tiles. A caller must never
+        // read the manifest of an earlier run as the result of this one.
+        if let Some(s) = &selection { s.finish().unwrap_or_else(|e| { eprintln!("vtmake build: {e}"); std::process::exit(111) }); }
         std::process::exit(EXIT_NODATA);
     }
 
@@ -372,6 +389,7 @@ fn build(argv: Vec<String>) {
     let default_layers: Vec<&str> = chunk_layer.iter().map(String::as_str).collect();
     plugin::init(&opts);
     let ctx = tile::Ctx {
+        selection: selection.as_ref(),
         skip_tiles: Default::default(),
         trial_blocked: Default::default(),
         drop_state: std::sync::Mutex::new((drop::Threshold { gap: 0, sequence: 0, extent: 0, attribute: 0, gamma: opts.gamma }, drop::Threshold { gap: 0, sequence: 0, extent: 0, attribute: 0, gamma: opts.gamma })),
@@ -422,8 +440,11 @@ fn build(argv: Vec<String>) {
                 }
                 groups[start..end].par_iter().for_each(|(k, r)| {
                     let (x, y) = ((k >> 32) as u32, *k as u32);
+                    if selection.as_ref().is_some_and(|s| !s.descend(z0, x, y)) { return; }
                     let mut feats = Vec::with_capacity(r.len());
-                    let mut draws = Vec::new();
+                    let mut draws = if ctx.pending.is_some() {
+                        Vec::with_capacity(positions[r.clone()].iter().map(|&pos| ctx.meta(pos).1.ndraws as usize).sum())
+                    } else { Vec::new() };
                     let mut g = Vec::new();
                     for &pos in &positions[r.clone()] {
                         let s = order[pos as usize];
@@ -448,7 +469,8 @@ fn build(argv: Vec<String>) {
                         });
                     }
                     if let Some(pending) = &ctx.pending {
-                        pending.lock().unwrap().push_task((z0, x, y, feats, draws));
+                        let task = tile::Spool::encode_task_refs(z0, x, y, &feats, &draws, (0, 0), 0);
+                        pending.lock().unwrap().push_encoded(task);
                     } else {
                         tile::process(&ctx, z0, x, y, feats, draws);
                     }
@@ -508,10 +530,16 @@ fn build(argv: Vec<String>) {
     }
     let meta = meta::metadata(&opts, stats, fb, &result, &layer_descriptions);
     sink.finish(&meta).expect("finish output");
+    if failed == usize::MAX {
+        if let Some(s) = &selection { s.finish().unwrap_or_else(|e| { eprintln!("vtmake build: {e}"); std::process::exit(111) }); }
+    }
     log("done");
     if failed != usize::MAX {
         eprintln!("\n\n\n*** NOTE TILES ONLY COMPLETE THROUGH ZOOM {} ***", result.maxzoom);
         std::process::exit(100);
+    }
+    if std::env::var("VTMAKE_WAGYU_MODE").as_deref() == Ok("stats") {
+        vtmake_wagyu::print_statistics();
     }
     if std::env::var("VTMAKE_WAGYU_MODE").as_deref() == Ok("verify") {
         let (calls, hits) = vtmake_wagyu::verification_counts();

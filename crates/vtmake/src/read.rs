@@ -28,10 +28,11 @@
 //! `.gz` files, CSV and FlatGeobuf are streamed (`stream`): the memory for the
 //! input text is bounded.
 
+mod pgcopy;
 mod stream;
 
 use crate::cli::{Projection, Source};
-use crate::store::{Chunk, FeatMeta, Val, encode_geom, put_varint};
+use crate::store::{Chunk, FeatMeta, encode_geom, put_varint};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use vtmake_core::{Draw, GeomType};
@@ -70,6 +71,8 @@ pub struct ReadOpts {
     pub felt_cpus: usize,
     pub empty_csv_null: bool,
     pub quiet: bool,
+    /// `--pgcopy-schema`: every source is a Postgres binary COPY stream.
+    pub pgcopy: Option<std::sync::Arc<vtmake_parse::pgcopy::Schema>>,
 }
 
 /// The read-time geometry options: `-aw`, `-pw`, `-pW` and
@@ -814,6 +817,11 @@ pub fn read_source(src: &Source, layer_file: &str, ro: &ReadOpts, base: u64, thr
         }
     };
     let ends = |s: &str, x: &str| s.len() > x.len() && s.ends_with(x);
+    if let Some(schema) = &ro.pgcopy {
+        let (mut chunks, n) = pgcopy::read_pgcopy(file, &fname, schema, ro, base, threads);
+        crate::attrs::generate_ids(&mut chunks, base, &crate::attrs::SeqPlan::Serial);
+        return Some((chunks, n + 1));
+    }
     if src.format == "fgb" || ends(&src.file, ".fgb") {
         let meta = file.metadata().ok().filter(|m| m.is_file());
         let Some(meta) = meta else {
@@ -1039,9 +1047,8 @@ fn intern_key(b: &mut Builder, name: &str) -> u32 {
     match b.keys.get(name) {
         Some(&k) => k,
         None => {
-            let n = b.keys.len() as u32;
+            let n = b.c.push_key(name.into());
             b.keys.insert(name.into(), n);
-            b.c.keys.push(name.into());
             n
         }
     }
@@ -1065,13 +1072,7 @@ fn intern_val(b: &mut Builder, ty: vtmake_core::AttrType, text: &[u8]) -> u32 {
     match found {
         Some(&i) => i,
         None => {
-            let n = c.vals.len() as u32;
-            c.vals.push(Val {
-                ty,
-                off: c.val_text.len() as u32,
-                len: text.len() as u32,
-            });
-            c.val_text.extend_from_slice(text);
+            let n = c.push_val(ty, text);
             let (vals, hasher) = (&c.vals, &b.hasher);
             let vt = &c.val_text;
             b.vals.insert_unique(h, n, |&i| {
@@ -1325,6 +1326,7 @@ mod tests {
             felt_cpus: cpus,
             empty_csv_null: false,
             quiet: true,
+            pgcopy: None,
         }
     }
 

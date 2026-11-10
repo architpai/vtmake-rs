@@ -29,8 +29,32 @@ pub struct FeatMeta {
 #[derive(Clone, Copy, Debug)]
 pub struct Val {
     pub ty: AttrType,
+    /// True if `slot` is valid: a string, a bool, or a number that
+    /// `vtmake_mvt::stringified_fast` converts and that is not NaN.
+    pub fast: bool,
+    /// The MVT dedup slot of the value (`MvtValue::slot`).
+    pub slot: u16,
     pub off: u32,
     pub len: u32,
+}
+
+impl Val {
+    /// The value `text` of type `ty` at `off` in `val_text`, with its slot.
+    pub fn new(ty: AttrType, off: u32, text: &[u8]) -> Val {
+        let (fast, slot) = match ty {
+            AttrType::String => (true, vtmake_mvt::str_slot(text)),
+            AttrType::Null => (false, 0),
+            _ => {
+                // SAFETY: as in `Chunk::val_text`, the text is from a `&str`.
+                let t = unsafe { std::str::from_utf8_unchecked(text) };
+                match vtmake_mvt::stringified_fast(ty, t) {
+                    Some(v) if !v.is_nan() => (true, v.slot()),
+                    _ => (false, 0),
+                }
+            }
+        };
+        Val { ty, fast, slot, off, len: text.len() as u32 }
+    }
 }
 
 /// The features of one input chunk.
@@ -45,6 +69,8 @@ pub struct Chunk {
     pub vals: Vec<Val>,
     pub val_text: Vec<u8>,
     pub keys: Vec<Box<str>>,
+    /// The MVT dedup slot of each key (`vtmake_mvt::key_slot`).
+    pub key_slots: Vec<u16>,
     pub layers: Vec<Box<str>>,
     /// With `--maximum-string-attribute-length` only: the attributes before the
     /// strings are cut, for the tile statistics. `stat_offs[i]`: the start of
@@ -132,6 +158,20 @@ pub fn encode_geom(g: &[Draw], out: &mut Vec<u8>) {
 }
 
 impl Chunk {
+    /// Add a key; returns its id.
+    pub fn push_key(&mut self, key: Box<str>) -> u32 {
+        self.key_slots.push(vtmake_mvt::key_slot(&key));
+        self.keys.push(key);
+        (self.keys.len() - 1) as u32
+    }
+
+    /// Add a value; returns its id.
+    pub fn push_val(&mut self, ty: AttrType, text: &[u8]) -> u32 {
+        self.vals.push(Val::new(ty, self.val_text.len() as u32, text));
+        self.val_text.extend_from_slice(text);
+        (self.vals.len() - 1) as u32
+    }
+
     pub fn id(&self, m: &FeatMeta) -> Option<u64> {
         (m.id != u32::MAX).then(|| self.ids[m.id as usize])
     }
@@ -196,3 +236,32 @@ pub struct Sorted {
 // Keep the tile tables within their memory budget.
 const _: () = assert!(std::mem::size_of::<FeatMeta>() == 64);
 const _: () = assert!(std::mem::size_of::<Sorted>() == 8);
+const _: () = assert!(std::mem::size_of::<Val>() == 12);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The precomputed slot is the slot of the value that the tile code makes.
+    #[test]
+    fn val_slot_is_the_value_slot() {
+        let mut c = Chunk::default();
+        for text in ["", "a", "a\0b", "1", "-1", "1.5", "0.1", "nan", "inf", "08", "0x1F", " 5", "true", "false", "18446744073709551616", "-0e0"] {
+            for ty in [AttrType::String, AttrType::Number, AttrType::Bool, AttrType::Null] {
+                let i = c.push_val(ty, text.as_bytes());
+                let v = c.vals[i as usize];
+                assert_eq!(c.val_text(&v), text);
+                match vtmake_mvt::stringified_to_mvt_value(ty, text) {
+                    Some(mv) if v.fast => {
+                        assert!(!mv.is_nan());
+                        assert_eq!(v.slot, mv.slot(), "{ty:?} {text:?}");
+                    }
+                    Some(mv) => assert!(mv.is_nan() || ty == AttrType::Number, "{ty:?} {text:?}"),
+                    None => assert!(!v.fast),
+                }
+            }
+        }
+        let k = c.push_key("name".into());
+        assert_eq!(c.key_slots[k as usize], vtmake_mvt::key_slot("name"));
+    }
+}

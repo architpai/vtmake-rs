@@ -32,6 +32,25 @@ impl MvtValue {
         }
     }
 
+    /// The dedup slot in a layer: `tippecanoe_hash() % 65536`.
+    #[inline]
+    pub fn slot(&self) -> u16 {
+        match self {
+            MvtValue::String(s) => crate::str_slot(s.as_bytes()),
+            v => v.tippecanoe_hash() as u16,
+        }
+    }
+
+    /// A float or double NaN (not equal to itself).
+    #[inline]
+    pub fn is_nan(&self) -> bool {
+        match self {
+            MvtValue::Float(f) => f.is_nan(),
+            MvtValue::Double(d) => d.is_nan(),
+            _ => false,
+        }
+    }
+
     /// `mvt_value::operator==` (same type and value; NaN is not equal to NaN).
     pub fn same(&self, o: &MvtValue) -> bool {
         match (self, o) {
@@ -86,28 +105,42 @@ fn integer_digits(s: &str) -> Option<(bool, &str)> {
 
 /// tippecanoe `stringified_to_mvt_value`. Returns None for null (nulls are not written).
 pub fn stringified_to_mvt_value(ty: AttrType, s: &str) -> Option<MvtValue> {
-    Some(match ty {
-        AttrType::Null => return None,
-        AttrType::Bool => MvtValue::Bool(s.as_bytes().first() == Some(&b't')),
-        AttrType::String => MvtValue::String(s.into()),
-        AttrType::Number => {
-            if let Some((neg, digits)) = integer_digits(s) {
-                if digits.len() > 1 && digits.starts_with('0') {
-                    // Base 0: octal, or not an integer.
-                    return Some(c_number(s));
-                }
-                if !neg {
-                    // strtoull: an overflow is ERANGE, then strtoll also fails (ERANGE).
-                    if let Ok(u) = digits.parse::<u64>() {
-                        return Some(if u <= i64::MAX as u64 { MvtValue::Int(u as i64) } else { MvtValue::Uint(u) });
-                    }
-                } else if let Ok(v) = format!("-{digits}").parse::<i64>() {
-                    return Some(MvtValue::Sint(v));
-                }
-            }
-            float_or_double(s)
+    match ty {
+        AttrType::Number => Some(number_fast(s).unwrap_or_else(|| c_number(s))),
+        _ => stringified_fast(ty, s),
+    }
+}
+
+/// `stringified_to_mvt_value` without the C parsers: None for null, and None
+/// for a number text that needs them (they can write a warning). Else the
+/// same value as `stringified_to_mvt_value`, without a side effect.
+pub fn stringified_fast(ty: AttrType, s: &str) -> Option<MvtValue> {
+    match ty {
+        AttrType::Null => None,
+        AttrType::Bool => Some(MvtValue::Bool(s.as_bytes().first() == Some(&b't'))),
+        AttrType::String => Some(MvtValue::String(s.into())),
+        AttrType::Number => number_fast(s),
+    }
+}
+
+fn number_fast(s: &str) -> Option<MvtValue> {
+    if let Some((neg, digits)) = integer_digits(s) {
+        if digits.len() > 1 && digits.starts_with('0') {
+            // Base 0: octal, or not an integer.
+            return None;
         }
-    })
+        // strtoull: an overflow is ERANGE, then strtoll also fails (ERANGE).
+        // strtoll: "-digits" fits in an i64 if digits <= 2^63.
+        if let Ok(u) = digits.parse::<u64>() {
+            if !neg {
+                return Some(if u <= i64::MAX as u64 { MvtValue::Int(u as i64) } else { MvtValue::Uint(u) });
+            }
+            if u <= 1 << 63 {
+                return Some(MvtValue::Sint((u as i64).wrapping_neg()));
+            }
+        }
+    }
+    float_or_double(s)
 }
 
 unsafe extern "C" {
@@ -179,17 +212,15 @@ fn c_number(s: &str) -> MvtValue {
     }
 }
 
-fn float_or_double(s: &str) -> MvtValue {
-    let Ok(d) = s.parse::<f64>() else {
-        // Not a number for Rust (for example `0x1F`, `9x`, ` 5`).
-        return c_number(s);
-    };
-    match s.parse::<f32>() {
+/// None: not a number for Rust (for example `0x1F`, `9x`, ` 5`).
+fn float_or_double(s: &str) -> Option<MvtValue> {
+    let d = s.parse::<f64>().ok()?;
+    Some(match s.parse::<f32>() {
         // strtof overflow (HUGE_VALF + ERANGE): use strtod.
         Ok(f) if f.is_infinite() && !d.is_infinite() => MvtValue::Double(d),
         Ok(f) if f as f64 == d => MvtValue::Float(f),
         _ => MvtValue::Double(d),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -218,5 +249,28 @@ mod tests {
         assert_eq!(n(""), MvtValue::Int(0));
         assert_eq!(n("5."), MvtValue::Int(5));
         assert_eq!(n("abc"), MvtValue::Double(0.0));
+        assert_eq!(n("-9223372036854775808"), MvtValue::Sint(i64::MIN));
+        assert_eq!(n("-9223372036854775809"), MvtValue::Float(-9223372036854775808.0));
+        assert_eq!(n("-0"), MvtValue::Sint(0));
+    }
+
+    /// `stringified_fast` gives the value of `stringified_to_mvt_value`, or None.
+    #[test]
+    fn fast_path_matches() {
+        let texts = ["5", "-3", "0.5", "1e+21", "3.0", "0", "-0", "08", "010", "0x1F", "9x", " -5", "", "5.", "abc", "nan", "NaN", "inf", "-inf",
+            "1e400", "-1e400", "1e-50", "18446744073709551615", "18446744073709551616", "-9223372036854775808", "-9223372036854775809",
+            "+5", "+", "-", ".5", "true", "false", "t", "a\0b", "3.000", "3.0001", "00", "-00"];
+        for t in texts {
+            for ty in [AttrType::Number, AttrType::Bool, AttrType::String, AttrType::Null] {
+                let slow = stringified_to_mvt_value(ty, t);
+                if let Some(fast) = stringified_fast(ty, t) {
+                    let slow = slow.unwrap();
+                    assert!(fast.same(&slow) || (fast.is_nan() && slow.is_nan()), "{ty:?} {t:?}: {fast:?} {slow:?}");
+                    assert_eq!(fast.tippecanoe_hash(), slow.tippecanoe_hash());
+                } else {
+                    assert!(ty == AttrType::Null || ty == AttrType::Number, "{ty:?} {t:?}");
+                }
+            }
+        }
     }
 }

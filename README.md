@@ -7,7 +7,7 @@ reimplementation of [felt/tippecanoe](https://github.com/felt/tippecanoe), and
 it is a drop-in replacement for tippecanoe v2.82.0 and its tools: felt's own
 test suite passes 200 of 205 targets (see "Compatibility" below). For the
 plain seed command line (below) it makes **byte-identical tiles**, and on a small
-2-CPU machine it is 3x to 18x faster than felt (see "Speed" below).
+2-CPU machine it is 6x to 28x faster than felt (see "Speed" below).
 
 vtmake would not exist without tippecanoe. Its tiling logic is a port of
 tippecanoe's code, and it uses wagyu and zlib. See [NOTICE](NOTICE) for the
@@ -52,24 +52,29 @@ Environment: `TIPPECANOE_MAX_THREADS` (thread count), `VTMAKE_GZIP=fast`
 (libdeflate: faster, other gzip bytes, same decoded tiles), `VTMAKE_VERBOSE=1`
 (phase times and memory).
 
+See [selective output](docs/selective-output.md) for `--only-tiles`,
+`--known-hashes` and `--hashes-out`, their formats and option restrictions.
+See [Postgres COPY input](docs/pgcopy.md) for `--pgcopy-schema`: read
+`COPY ... TO STDOUT (FORMAT binary)` directly, with no GeoJSON step.
+
 ## Speed
 
-Wall time of the same task on public OpenStreetMap data, one run each.
-**felt** = felt/tippecanoe `4f26211` (v2.82.0). "Same tiles" = the SHA3 of all
-tiles is equal to felt's.
+Wall time of the same task on public OpenStreetMap data (vtmake: the mean of 2
+runs; the `-zg` rows: 1 run). **felt** = felt/tippecanoe `4f26211` (v2.82.0).
+"Same tiles" = the SHA3 of all tiles is equal to felt's.
 
 Machine: a Docker container with 2 CPUs, 8 GB for the process and the page
-cache, 500 IOPS and 82 MB/s disk (`bench/run.sh`). Full table:
-[bench/results/public-speed.md](bench/results/public-speed.md).
+cache, 500 IOPS and 82 MB/s disk (`bench/run.sh`). Full table, with the
+all-CPU runs: [bench/results/public-speed.md](bench/results/public-speed.md).
 
 | Task | felt | vtmake | vtmake vs felt | Same tiles |
 |---|---:|---:|---:|---|
-| Polygon seed (7.1 M OSM buildings) | 840 s | **139 s** | 6.0x | yes |
-| Point seed (7.1 M points) | 390 s | **21 s** | 18.2x | yes |
-| Road seed (2.43 M OSM roads) | 354 s | **49 s** | 7.3x | yes |
-| felt's common `-zg` command, points | 491 s | **95 s** | 5.2x | yes |
-| felt's common `-zg` command, polygons | 1,034 s | **283 s** | 3.7x | yes |
-| felt's common `-zg` command, roads | 368 s | **112 s** | 3.3x | yes |
+| Polygon seed (7.1 M OSM buildings) | 840 s | **63.3 s** | 13.3x | yes |
+| Point seed (7.1 M points) | 390 s | **14.1 s** | 27.6x | yes |
+| Road seed (2.43 M OSM roads) | 354 s | **31.9 s** | 11.1x | yes |
+| felt's common `-zg` command, points | 491 s | **51.6 s** | 9.5x | yes |
+| felt's common `-zg` command, polygons | 1,034 s | **157 s** | 6.6x | yes |
+| felt's common `-zg` command, roads | 368 s | **64.9 s** | 5.7x | yes |
 
 ## Compatibility
 
@@ -87,6 +92,8 @@ cargo test --workspace
 ```
 
 vtmake builds on Linux (x86-64 and aarch64). macOS is not supported yet.
+It needs a recent stable Rust: 1.91 is too old (`AtomicUsize::try_update`).
+Tested with Rust 1.99.1.
 
 Some tests need extra data. Without it, they skip:
 

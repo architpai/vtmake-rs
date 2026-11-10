@@ -12,7 +12,7 @@ fn random_and_adversarial() {
     };
     let mut hits = 0;
     for case in 0..1_000_000 {
-        let n = 3 + (rand() % 14) as usize;
+        let n = 3 + (rand() % if case % 10 == 0 { 63 } else { 14 }) as usize;
         let mut g = Vec::new();
         for i in 0..n {
             let (x, y) = if case % 2 == 0 {
